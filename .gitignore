@@ -53,3 +53,10 @@ dkms.conf
 
 # debug information files
 *.dwo
+# --- Fase 2: artefactos de build y logs ---
+
+# Binarios compilados
+bin/
+
+# Archivos de log del servidor
+*.log
