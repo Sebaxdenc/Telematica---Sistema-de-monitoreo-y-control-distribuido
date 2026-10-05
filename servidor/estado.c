@@ -247,3 +247,79 @@ int estado_resumen(char *out, size_t out_cap) {
     pthread_mutex_unlock(&g_mutex);
     return cuenta;
 }
+
+int estado_revisar_inactividad(long t_inactivo_seg, long t_baja_seg,
+                               estado_cambio_cb cb) {
+    int cambios = 0;
+    time_t ahora = time(NULL);
+
+    pthread_mutex_lock(&g_mutex);
+
+    for (int i = 0; i < EST_MAX_NODOS; ++i) {
+        if (!g_nodos[i].en_uso) {
+            continue;
+        }
+        nodo_t *n = &g_nodos[i];
+        long inactivo = (long)(ahora - n->ultima_actividad);
+
+        /* ACTIVO/INACTIVO sin senal por mas de t_baja_seg -> baja. */
+        if (inactivo > t_baja_seg &&
+            (n->estado == NODO_ACTIVO || n->estado == NODO_INACTIVO)) {
+            /* Copiamos el id antes de liberar para el callback. */
+            char id_copia[EST_ID_LEN];
+            snprintf(id_copia, sizeof(id_copia), "%s", n->id);
+            n->en_uso = 0;            /* dar de baja: libera la entrada */
+            n->estado = NODO_DESCONECTADO;
+            cambios++;
+            if (cb != NULL) {
+                cb(id_copia, NODO_DESCONECTADO, inactivo);
+            }
+            continue;
+        }
+
+        /* ACTIVO sin senal por mas de t_inactivo_seg -> INACTIVO. */
+        if (inactivo > t_inactivo_seg && n->estado == NODO_ACTIVO) {
+            n->estado = NODO_INACTIVO;
+            cambios++;
+            if (cb != NULL) {
+                cb(n->id, NODO_INACTIVO, inactivo);
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_mutex);
+    return cambios;
+}
+
+int estado_chequear_seq(const char *id, unsigned int seq) {
+    if (id == NULL) {
+        return -1;
+    }
+    pthread_mutex_lock(&g_mutex);
+
+    int idx = buscar_idx(id);
+    if (idx < 0) {
+        pthread_mutex_unlock(&g_mutex);
+        return -1;
+    }
+
+    nodo_t *n = &g_nodos[idx];
+
+    if (!n->tiene_seq_udp) {
+        /* Primer datagrama del nodo: se acepta y se fija la referencia. */
+        n->tiene_seq_udp = 1;
+        n->ultimo_seq_udp = seq;
+        pthread_mutex_unlock(&g_mutex);
+        return 1;
+    }
+
+    if (seq > n->ultimo_seq_udp) {
+        n->ultimo_seq_udp = seq;
+        pthread_mutex_unlock(&g_mutex);
+        return 1; /* en orden y nuevo */
+    }
+
+    /* seq <= ultimo aceptado: duplicado o fuera de orden. */
+    pthread_mutex_unlock(&g_mutex);
+    return 0;
+}

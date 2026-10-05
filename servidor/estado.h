@@ -47,6 +47,10 @@ typedef struct {
     time_t        registrado_en;
     time_t        ultima_actividad;
 
+    /* Control de duplicados/orden en UDP: ultimo SEQ_NUM aceptado. */
+    unsigned int  ultimo_seq_udp;
+    int           tiene_seq_udp;   /* 0 hasta recibir el primer datagrama */
+
     /* Historico circular de telemetria. */
     muestra_t muestras[EST_HIST_POR_NODO];
     int       hist_inicio;   /* indice de la muestra mas antigua */
@@ -110,5 +114,48 @@ int estado_resumen(char *out, size_t out_cap);
 
 /* Nombre legible de un estado de nodo. */
 const char *estado_nombre(nodo_estado_t e);
+
+/*
+ * estado_chequear_seq: control de duplicados y orden para los datagramas UDP
+ * (TELEMETRY / HEARTBEAT). Compara 'seq' con el ultimo SEQ_NUM aceptado del
+ * nodo 'id':
+ *
+ *   - si es el primer datagrama del nodo, o seq > ultimo aceptado, lo ACEPTA
+ *     y actualiza el ultimo aceptado. Retorna 1.
+ *   - si seq <= ultimo aceptado, lo RECHAZA (duplicado o fuera de orden) sin
+ *     actualizar. Retorna 0.
+ *   - si el nodo no esta registrado, retorna -1.
+ *
+ * Coherente con la Fase 1: no hay retransmision; solo se filtran repetidos y
+ * llegadas fuera de orden usando el numero de secuencia.
+ */
+int estado_chequear_seq(const char *id, unsigned int seq);
+
+/*
+ * Callback que el barrido de inactividad invoca por cada cambio de estado de
+ * un nodo, para que el llamador (el hilo monitor) lo registre en el log.
+ *
+ *  id             identificador del nodo
+ *  nuevo_estado   estado al que transiciono
+ *  inactivo_seg   segundos que llevaba sin actividad
+ */
+typedef void (*estado_cambio_cb)(const char *id, nodo_estado_t nuevo_estado,
+                                 long inactivo_seg);
+
+/*
+ * estado_revisar_inactividad: recorre la tabla y aplica las transiciones de
+ * la maquina de estados del nodo segun el tiempo sin actividad:
+ *
+ *   ACTIVO   --(sin senal > t_inactivo_seg)-->  INACTIVO
+ *   INACTIVO --(sin senal > t_baja_seg)-->      baja (entrada liberada)
+ *
+ * Por cada transicion invoca 'cb' (si no es NULL). Devuelve el numero total
+ * de nodos que cambiaron de estado en esta pasada.
+ *
+ * Se ejecuta bajo el mutex de estado, por lo que es seguro llamarla desde el
+ * hilo monitor mientras los hilos TCP/UDP tocan la tabla.
+ */
+int estado_revisar_inactividad(long t_inactivo_seg, long t_baja_seg,
+                               estado_cambio_cb cb);
 
 #endif /* ESTADO_H */

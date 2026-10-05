@@ -10,6 +10,13 @@
  */
 
 /*
+ * manejador_config_auth: fija la ubicacion del servicio de autenticacion
+ * (host y puerto) que el manejador usara al procesar AUTH_REQ. Debe llamarse
+ * una vez al arrancar el servidor, antes de aceptar conexiones.
+ */
+void manejador_config_auth(const char *auth_host, const char *auth_puerto);
+
+/*
  * manejar_conexion_tcp: atiende una conexion TCP ya aceptada. Lee mensajes
  * del socket, los interpreta segun PMCD/1.0, actualiza el estado y envia las
  * respuestas correspondientes. Registra cada peticion y respuesta en el log

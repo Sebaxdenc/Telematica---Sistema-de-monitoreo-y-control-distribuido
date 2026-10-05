@@ -21,6 +21,8 @@
 #include "estado.h"
 #include "manejador.h"
 #include "udp_worker.h"
+#include "monitor.h"
+#include "sesiones.h"
 
 #include "log_utils.h"
 #include "pmcd_protocol.h"
@@ -74,17 +76,21 @@ static void *hilo_conexion(void *arg) {
 }
 
 static void uso(const char *prog) {
-    fprintf(stderr, "Uso: %s <puerto> <archivoDeLogs>\n", prog);
+    fprintf(stderr,
+            "Uso: %s <puerto> <archivoDeLogs> <authHost> <authPuerto>\n",
+            prog);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
+    if (argc != 5) {
         uso(argv[0]);
         return EXIT_FAILURE;
     }
 
     const char *puerto = argv[1];
     const char *archivo_logs = argv[2];
+    const char *auth_host = argv[3];
+    const char *auth_puerto = argv[4];
 
     char *fin = NULL;
     long p = strtol(puerto, &fin, 10);
@@ -93,8 +99,18 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    fin = NULL;
+    long ap = strtol(auth_puerto, &fin, 10);
+    if (fin == auth_puerto || *fin != '\0' || ap < 1 || ap > 65535) {
+        fprintf(stderr, "Puerto de auth invalido: '%s' (use 1..65535)\n",
+                auth_puerto);
+        return EXIT_FAILURE;
+    }
+
     su_ignorar_sigpipe();
     estado_init();
+    sesiones_init();
+    manejador_config_auth(auth_host, auth_puerto);
 
     /* Manejo de senales para cierre ordenado. */
     struct sigaction sa;
@@ -128,14 +144,16 @@ int main(int argc, char *argv[]) {
     }
 
     {
-        char detalle[160];
+        char detalle[224];
         snprintf(detalle, sizeof(detalle),
-                 "servidor PMCD/1.0 en puerto %s (TCP+UDP), max %d conexiones, logs='%s'",
-                 puerto, MAX_CONNECTIONS, archivo_logs);
+                 "servidor PMCD/1.0 en puerto %s (TCP+UDP), max %d conexiones, "
+                 "auth=%s:%s, logs='%s'",
+                 puerto, MAX_CONNECTIONS, auth_host, auth_puerto, archivo_logs);
         log_evento(LOG_INFO, NULL, "ARRANQUE", detalle);
     }
     printf("Servidor PMCD/1.0 listo en puerto %s (TCP+UDP, hasta %d conexiones). "
-           "Ctrl+C para detener.\n", puerto, MAX_CONNECTIONS);
+           "Servicio de auth en %s:%s. Ctrl+C para detener.\n",
+           puerto, MAX_CONNECTIONS, auth_host, auth_puerto);
 
     /* Hilo dedicado a la recepcion UDP (telemetria / heartbeat). */
     volatile int parar_udp = 0;
@@ -144,6 +162,23 @@ int main(int argc, char *argv[]) {
     int udp_thr = pthread_create(&udp_th, NULL, udp_worker, &udp_args);
     if (udp_thr != 0) {
         log_evento(LOG_INFO, NULL, "ARRANQUE", "no se pudo crear el hilo UDP");
+        su_close(tcp_fd);
+        su_close(udp_fd);
+        log_cerrar();
+        estado_destruir();
+        return EXIT_FAILURE;
+    }
+
+    /* Hilo monitor: detecta nodos inactivos y los da de baja por temporizador. */
+    volatile int parar_monitor = 0;
+    monitor_args_t mon_args = { .parar = &parar_monitor };
+    pthread_t mon_th;
+    int mon_thr = pthread_create(&mon_th, NULL, monitor_worker, &mon_args);
+    if (mon_thr != 0) {
+        log_evento(LOG_INFO, NULL, "ARRANQUE",
+                   "no se pudo crear el hilo monitor");
+        parar_udp = 1;
+        pthread_join(udp_th, NULL);
         su_close(tcp_fd);
         su_close(udp_fd);
         log_cerrar();
@@ -208,9 +243,11 @@ int main(int argc, char *argv[]) {
     /* --- Cierre ordenado --- */
     log_evento(LOG_INFO, NULL, "CIERRE", "senal recibida, deteniendo servidor");
 
-    /* Detener el hilo UDP y esperarlo. */
+    /* Detener los hilos UDP y monitor y esperarlos. */
     parar_udp = 1;
+    parar_monitor = 1;
     pthread_join(udp_th, NULL);
+    pthread_join(mon_th, NULL);
 
     pthread_attr_destroy(&attr);
     su_close(tcp_fd);

@@ -101,6 +101,18 @@ void *udp_worker(void *arg) {
                            "descartada: nodo no registrado");
                 continue;
             }
+
+            /* Control de duplicados / orden por SEQ_NUM. */
+            int seqok = estado_chequear_seq(id, h.seq_num);
+            if (seqok == 0) {
+                char d[96];
+                snprintf(d, sizeof(d),
+                         "descartada: duplicado o fuera de orden (seq=%u)",
+                         h.seq_num);
+                log_evento(LOG_INFO, endpoint, "TELEMETRY", d);
+                continue;
+            }
+
             estado_agregar_muestra(id, payload);
         } else if (h.tipo == PMCD_HEARTBEAT) {
             char detalle[PMCD_MAX_PAYLOAD + 32];
@@ -108,6 +120,15 @@ void *udp_worker(void *arg) {
             log_evento(LOG_PETICION, endpoint, "HEARTBEAT", detalle);
 
             if (id[0] != '\0' && estado_nodo_registrado(id)) {
+                int seqok = estado_chequear_seq(id, h.seq_num);
+                if (seqok == 0) {
+                    char d[96];
+                    snprintf(d, sizeof(d),
+                             "descartado: duplicado o fuera de orden (seq=%u)",
+                             h.seq_num);
+                    log_evento(LOG_INFO, endpoint, "HEARTBEAT", d);
+                    continue;
+                }
                 estado_marcar_actividad(id);
             }
         } else {
