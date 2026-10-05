@@ -47,7 +47,12 @@ static int registrar(const char *host, const char *puerto,
     pmcd_header_t h;
     size_t total = 0;
     pmcd_header_init(&h, PMCD_REG_REQ, PMCD_FLAG_REQUIERE_ACK, (*seq)++);
-    pmcd_pack(buf, sizeof(buf), &h, payload, strlen(payload), &total);
+    if (pmcd_pack(buf, sizeof(buf), &h, payload, strlen(payload),
+                  &total) != PMCD_OK) {
+        fprintf(stderr, "[nodo %s] error al empaquetar REG_REQ\n", nodo_id);
+        su_close(fd);
+        return -1;
+    }
 
     if (su_send_all(fd, buf, total) != 0) {
         fprintf(stderr, "[nodo %s] fallo al enviar REG_REQ\n", nodo_id);
@@ -101,13 +106,19 @@ static int enviar_udp(int udp_fd, const struct sockaddr *dst, socklen_t dstlen,
     return 0;
 }
 
-/* Envia un EVENT critico por TCP y espera EVENT_ACK. Retorna 0/-1. */
+/* Codigos de retorno de enviar_evento. */
+#define EV_OK           0   /* EVENT_ACK recibido                          */
+#define EV_ERROR       -1   /* fallo de comunicacion (servidor caido, etc.)*/
+#define EV_NO_REGISTRADO -2 /* el servidor respondio ERROR 409             */
+
+/* Envia un EVENT critico por TCP y espera EVENT_ACK.
+   Retorna EV_OK / EV_ERROR / EV_NO_REGISTRADO. */
 static int enviar_evento(const char *host, const char *puerto,
                          const char *nodo_id, uint32_t *seq,
                          const char *descripcion) {
     int fd = su_conectar_cliente_tcp(host, puerto);
     if (fd < 0) {
-        return -1;
+        return EV_ERROR;
     }
 
     char payload[PMCD_MAX_PAYLOAD] = "";
@@ -120,11 +131,15 @@ static int enviar_evento(const char *host, const char *puerto,
     pmcd_header_t h;
     size_t total = 0;
     pmcd_header_init(&h, PMCD_EVENT, PMCD_FLAG_REQUIERE_ACK, (*seq)++);
-    pmcd_pack(buf, sizeof(buf), &h, payload, strlen(payload), &total);
+    if (pmcd_pack(buf, sizeof(buf), &h, payload, strlen(payload),
+                  &total) != PMCD_OK) {
+        su_close(fd);
+        return EV_ERROR;
+    }
 
     if (su_send_all(fd, buf, total) != 0) {
         su_close(fd);
-        return -1;
+        return EV_ERROR;
     }
 
     pmcd_header_t rh;
@@ -135,10 +150,23 @@ static int enviar_evento(const char *host, const char *puerto,
     if (r == 1 && rh.tipo == PMCD_EVENT_ACK) {
         printf("[nodo %s] EVENT confirmado (EVENT_ACK): %s\n",
                nodo_id, rpayload);
-        return 0;
+        return EV_OK;
+    }
+    if (r == 1 && rh.tipo == PMCD_ERROR) {
+        char codigo[8] = "";
+        pmcd_get_field(rpayload, "codigo", codigo, sizeof(codigo));
+        if (strcmp(codigo, "409") == 0) {
+            /* El servidor no nos reconoce: probablemente nos dio de baja por
+               inactividad. Hay que re-registrarse. */
+            printf("[nodo %s] EVENT rechazado (409): el servidor no me "
+                   "reconoce, hay que re-registrar\n", nodo_id);
+            return EV_NO_REGISTRADO;
+        }
+        printf("[nodo %s] EVENT rechazado: %s\n", nodo_id, rpayload);
+        return EV_ERROR;
     }
     printf("[nodo %s] EVENT sin ACK (r=%d)\n", nodo_id, r);
-    return -1;
+    return EV_ERROR;
 }
 
 int main(int argc, char *argv[]) {
@@ -223,7 +251,15 @@ int main(int argc, char *argv[]) {
         if (ciclo % 3 == 0 && temp > 80.0) {
             char desc[64];
             snprintf(desc, sizeof(desc), "temp=%.1f supera umbral 80.0", temp);
-            enviar_evento(host, puerto, nodo_id, &seq, desc);
+            int ev = enviar_evento(host, puerto, nodo_id, &seq, desc);
+            if (ev == EV_NO_REGISTRADO) {
+                /* Fuimos dados de baja: re-registrar antes de seguir. */
+                if (registrar(host, puerto, nodo_id, tipo, &seq) == 0) {
+                    printf("[nodo %s] re-registro exitoso tras baja\n", nodo_id);
+                    /* Reintentar el evento una vez ya registrados. */
+                    enviar_evento(host, puerto, nodo_id, &seq, desc);
+                }
+            }
         }
 
         /* Cada 5 ciclos simula "sin telemetria nueva": manda HEARTBEAT. */

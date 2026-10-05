@@ -3,11 +3,12 @@
  * Distribuido (PMCD/1.0).
  *
  * Uso:
- *     ./cliente <host> <puerto> <usuario> [comando]
+ *     ./cliente <host> <puerto> <usuario> <clave> [comando]
  *
  *   host      nombre/direccion del servidor (resuelto por getaddrinfo).
  *   puerto    puerto del servidor.
- *   usuario   usuario para autenticarse (stub de Fase 2).
+ *   usuario   usuario para autenticarse.
+ *   clave     clave del usuario.
  *   comando   (opcional) ejecuta un solo comando y termina. Si se omite,
  *             entra en modo interactivo.
  *
@@ -17,9 +18,10 @@
  *   resumen                   lista de nodos y su estado
  *   salir                     termina el cliente
  *
- * El cliente se autentica una vez (AUTH_REQ) y guarda el token que el
- * servidor devuelve; ese token se incluye en cada QUERY_REQ. En Fase 2 la
- * validacion es un stub (token dummy); la autenticacion real es de Fase 3.
+ * Fase 3: la autenticacion es real (el servidor consulta al servicio de auth).
+ * El cliente guarda usuario/clave y el token; si una consulta falla por token
+ * expirado o invalido (ERROR 401), se RE-AUTENTICA automaticamente una vez y
+ * reintenta la operacion.
  */
 
 #include "pmcd_protocol.h"
@@ -30,6 +32,14 @@
 #include <string.h>
 
 static uint32_t g_seq = 1;
+
+/* Estado de sesion del cliente, para poder re-autenticar de forma automatica
+   cuando el token expira o el servidor lo invalida. */
+static char g_host[128]    = "";
+static char g_puerto[16]   = "";
+static char g_usuario[64]  = "";
+static char g_clave[64]    = "";
+static char g_token[64]    = "";
 
 /* Abre una conexion, envia (tipo,payload), lee la respuesta a rpayload y
    devuelve el tipo de la respuesta (o -1 en error). Cierra la conexion. */
@@ -65,23 +75,30 @@ static int transaccion(const char *host, const char *puerto,
     return (int)rh.tipo;
 }
 
-/* Autenticacion (stub). Guarda el token en 'token'. Retorna 0/-1. */
-static int autenticar(const char *host, const char *puerto,
-                      const char *usuario, char *token, size_t tcap) {
+/* Autenticacion real (Fase 3): envia usuario+clave; el servidor consulta al
+   servicio de auth. Guarda el token en g_token. Retorna 0/-1.
+   Si 'verboso' es 0, no imprime el mensaje de exito (para la re-auth silenciosa). */
+static int autenticar_ex(int verboso) {
     char payload[PMCD_MAX_PAYLOAD] = "";
-    pmcd_build_payload(payload, sizeof(payload), "usuario", usuario);
-    pmcd_build_payload(payload, sizeof(payload), "clave", "demo");
+    pmcd_build_payload(payload, sizeof(payload), "usuario", g_usuario);
+    pmcd_build_payload(payload, sizeof(payload), "clave", g_clave);
 
     char resp[PMCD_MAX_PAYLOAD];
-    int tipo = transaccion(host, puerto, PMCD_AUTH_REQ, payload,
+    int tipo = transaccion(g_host, g_puerto, PMCD_AUTH_REQ, payload,
                            resp, sizeof(resp));
     if (tipo < 0) {
         fprintf(stderr, "No se pudo contactar al servidor para autenticar.\n");
         return -1;
     }
     if (tipo == PMCD_AUTH_RESP) {
-        if (pmcd_get_field(resp, "token", token, tcap) == 1 && token[0] != '\0') {
-            printf("Autenticado como '%s'. token=%s\n", usuario, token);
+        if (pmcd_get_field(resp, "token", g_token, sizeof(g_token)) == 1 &&
+            g_token[0] != '\0') {
+            char rol[32] = "";
+            pmcd_get_field(resp, "rol", rol, sizeof(rol));
+            if (verboso) {
+                printf("Autenticado como '%s' (rol=%s). token=%s\n",
+                       g_usuario, rol[0] ? rol : "?", g_token);
+            }
             return 0;
         }
         fprintf(stderr, "AUTH_RESP sin token: %s\n", resp);
@@ -104,51 +121,64 @@ static void mostrar_respuesta(int tipo, const char *resp) {
     }
 }
 
-static void cmd_estado(const char *host, const char *puerto,
-                       const char *token, const char *nodo_id) {
-    char payload[PMCD_MAX_PAYLOAD] = "";
-    pmcd_build_payload(payload, sizeof(payload), "token", token);
-    pmcd_build_payload(payload, sizeof(payload), "nodo_id", nodo_id);
-    pmcd_build_payload(payload, sizeof(payload), "consulta", "INSTANTANEO");
+/* Devuelve 1 si el payload de un ERROR corresponde a token invalido/expirado
+   (codigo 401), para decidir si conviene re-autenticar. */
+static int es_error_token(int tipo, const char *resp) {
+    if (tipo != PMCD_ERROR) {
+        return 0;
+    }
+    char codigo[8] = "";
+    pmcd_get_field(resp, "codigo", codigo, sizeof(codigo));
+    return strcmp(codigo, "401") == 0;
+}
 
+/*
+ * consultar: envia un QUERY_REQ construido por el llamador (sin el token, que
+ * agrega esta funcion desde g_token). Si el servidor responde ERROR 401
+ * (token invalido/expirado), se RE-AUTENTICA una vez y reintenta.
+ *
+ *  campos_extra   payload sin token (p.ej. "nodo_id=..;consulta=..")
+ */
+static void consultar(const char *campos_extra) {
+    char payload[PMCD_MAX_PAYLOAD];
     char resp[PMCD_MAX_PAYLOAD];
-    int tipo = transaccion(host, puerto, PMCD_QUERY_REQ, payload,
+
+    snprintf(payload, sizeof(payload), "token=%s;%s", g_token, campos_extra);
+    int tipo = transaccion(g_host, g_puerto, PMCD_QUERY_REQ, payload,
                            resp, sizeof(resp));
+
+    if (es_error_token(tipo, resp)) {
+        printf("[token invalido/expirado: re-autenticando...]\n");
+        if (autenticar_ex(0) == 0) {
+            snprintf(payload, sizeof(payload), "token=%s;%s",
+                     g_token, campos_extra);
+            tipo = transaccion(g_host, g_puerto, PMCD_QUERY_REQ, payload,
+                               resp, sizeof(resp));
+        }
+    }
     mostrar_respuesta(tipo, resp);
 }
 
-static void cmd_historico(const char *host, const char *puerto,
-                          const char *token, const char *nodo_id, int n) {
-    char payload[PMCD_MAX_PAYLOAD] = "";
-    char nbuf[16];
-    pmcd_build_payload(payload, sizeof(payload), "token", token);
-    pmcd_build_payload(payload, sizeof(payload), "nodo_id", nodo_id);
-    pmcd_build_payload(payload, sizeof(payload), "consulta", "HISTORICO");
-    snprintf(nbuf, sizeof(nbuf), "%d", n);
-    pmcd_build_payload(payload, sizeof(payload), "n", nbuf);
-
-    char resp[PMCD_MAX_PAYLOAD];
-    int tipo = transaccion(host, puerto, PMCD_QUERY_REQ, payload,
-                           resp, sizeof(resp));
-    mostrar_respuesta(tipo, resp);
+static void cmd_estado(const char *nodo_id) {
+    char extra[128];
+    snprintf(extra, sizeof(extra), "nodo_id=%s;consulta=INSTANTANEO", nodo_id);
+    consultar(extra);
 }
 
-static void cmd_resumen(const char *host, const char *puerto,
-                        const char *token) {
-    char payload[PMCD_MAX_PAYLOAD] = "";
-    pmcd_build_payload(payload, sizeof(payload), "token", token);
-    pmcd_build_payload(payload, sizeof(payload), "consulta", "RESUMEN");
+static void cmd_historico(const char *nodo_id, int n) {
+    char extra[128];
+    snprintf(extra, sizeof(extra), "nodo_id=%s;consulta=HISTORICO;n=%d",
+             nodo_id, n);
+    consultar(extra);
+}
 
-    char resp[PMCD_MAX_PAYLOAD];
-    int tipo = transaccion(host, puerto, PMCD_QUERY_REQ, payload,
-                           resp, sizeof(resp));
-    mostrar_respuesta(tipo, resp);
+static void cmd_resumen(void) {
+    consultar("consulta=RESUMEN");
 }
 
 /* Ejecuta un comando ya tokenizado (argv-style). Retorna 1 para continuar,
    0 para salir. */
-static int ejecutar(const char *host, const char *puerto, const char *token,
-                    char **tok, int ntok) {
+static int ejecutar(char **tok, int ntok) {
     if (ntok == 0) {
         return 1;
     }
@@ -156,13 +186,13 @@ static int ejecutar(const char *host, const char *puerto, const char *token,
         return 0;
     }
     if (strcmp(tok[0], "estado") == 0 && ntok >= 2) {
-        cmd_estado(host, puerto, token, tok[1]);
+        cmd_estado(tok[1]);
     } else if (strcmp(tok[0], "historico") == 0 && ntok >= 2) {
         int n = (ntok >= 3) ? atoi(tok[2]) : 5;
         if (n <= 0) n = 5;
-        cmd_historico(host, puerto, token, tok[1], n);
+        cmd_historico(tok[1], n);
     } else if (strcmp(tok[0], "resumen") == 0) {
-        cmd_resumen(host, puerto, token);
+        cmd_resumen();
     } else {
         printf("Comandos: estado <nodo_id> | historico <nodo_id> [n] | "
                "resumen | salir\n");
@@ -182,29 +212,30 @@ static int tokenizar(char *linea, char **tok, int max) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 4) {
+    if (argc < 5) {
         fprintf(stderr,
-                "Uso: %s <host> <puerto> <usuario> [comando...]\n"
+                "Uso: %s <host> <puerto> <usuario> <clave> [comando...]\n"
                 "  Comandos: estado <nodo_id> | historico <nodo_id> [n] | "
                 "resumen\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    const char *host = argv[1];
-    const char *puerto = argv[2];
-    const char *usuario = argv[3];
-
     su_ignorar_sigpipe();
 
-    char token[64] = "";
-    if (autenticar(host, puerto, usuario, token, sizeof(token)) != 0) {
+    /* Guardar la sesion en el estado global (para re-autenticacion). */
+    snprintf(g_host, sizeof(g_host), "%s", argv[1]);
+    snprintf(g_puerto, sizeof(g_puerto), "%s", argv[2]);
+    snprintf(g_usuario, sizeof(g_usuario), "%s", argv[3]);
+    snprintf(g_clave, sizeof(g_clave), "%s", argv[4]);
+
+    if (autenticar_ex(1) != 0) {
         return EXIT_FAILURE;
     }
 
-    /* Modo comando unico: argv[4..] forman un comando. */
-    if (argc > 4) {
-        int r = ejecutar(host, puerto, token, &argv[4], argc - 4);
-        return r >= 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    /* Modo comando unico: argv[5..] forman un comando. */
+    if (argc > 5) {
+        ejecutar(&argv[5], argc - 5);
+        return EXIT_SUCCESS;
     }
 
     /* Modo interactivo. */
@@ -220,7 +251,7 @@ int main(int argc, char *argv[]) {
         }
         char *tok[8];
         int ntok = tokenizar(linea, tok, 8);
-        if (!ejecutar(host, puerto, token, tok, ntok)) {
+        if (!ejecutar(tok, ntok)) {
             break;
         }
     }

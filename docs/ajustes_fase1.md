@@ -39,19 +39,21 @@ Los ejemplos base de EAFIT usaban `inet_pton` con IP fija; aquí se reemplazó p
 
 Implementado en `comun/socket_utils.c`.
 
-## 3. Autenticación: stub en Fase 2, real en Fase 3
+## 3. Autenticación: stub en Fase 2, real en Fase 3 ✅ (implementada)
 
-La Fase 1 describe un servicio de autenticación separado con tokens. En la Fase 2, para
-no bloquear el flujo de consultas, la autenticación es un **stub**:
+La Fase 1 describe un servicio de autenticación separado con tokens. En la **Fase 2**
+fue un stub (token fijo `TOKEN-FASE2`, solo se exigía token no vacío).
 
-- `AUTH_REQ` con un usuario no vacío recibe un `AUTH_RESP` con un token fijo
-  (`TOKEN-FASE2`).
-- `QUERY_REQ` exige un token **no vacío** en el payload; si falta, responde `ERROR 401`.
-  No se valida el contenido del token todavía.
-- El servicio de autenticación **separado** y la validación real de credenciales/roles
-  se implementan en la Fase 3.
+En la **Fase 3 ya está implementada de verdad**:
 
-Implementado en `servidor/manejador.c` (`on_auth_req`, `on_query_req`).
+- Un **servicio de autenticación separado** (proceso `auth/`, binario `bin/auth`) con
+  su propio almacén de credenciales y roles.
+- El servidor central consulta a ese servicio en cada `AUTH_REQ`, guarda la sesión
+  (token → usuario, rol, expiración) y valida el token real en cada `QUERY_REQ`.
+- Roles: `admin` (administrador) y `operador`. Tokens opacos con expiración.
+
+Detalle completo en `docs/fase3_resiliencia.md`. Implementado en `auth/auth.c`,
+`servidor/auth_cliente.c`, `servidor/sesiones.c` y `servidor/manejador.c`.
 
 ## 4. Selección de transporte: confirmada
 
@@ -89,10 +91,12 @@ La Fase 2 incluye una **base de concurrencia** (no la resiliencia completa de Fa
   del módulo `estado`.
 - **Cierre ordenado** con `SIGINT`/`SIGTERM`.
 
-Queda para la **Fase 3**: temporizadores de aplicación, retransmisión, detección de
-duplicados y control de mensajes fuera de orden (para los mensajes que lo requieran),
-además de la autenticación real y las transiciones de estado ACTIVO→INACTIVO→baja de
-nodos por inactividad.
+**Implementado en la Fase 3** (ver `docs/fase3_resiliencia.md`): temporizadores para la
+detección de nodos inactivos y las transiciones ACTIVO→INACTIVO→baja (hilo monitor),
+detección de duplicados y control de orden en UDP por `SEQ_NUM`, autenticación real con
+servicio separado, y re-registro/re-autenticación en nodo y cliente. Coherente con la
+Fase 1, **no** se añadió retransmisión a la telemetría (una muestra perdida se
+reemplaza por la siguiente); solo se filtran duplicados/llegadas fuera de orden.
 
 ## 7. Detalles de implementación menores
 

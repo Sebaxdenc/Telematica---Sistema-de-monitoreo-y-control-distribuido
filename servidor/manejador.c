@@ -5,10 +5,10 @@
  *   - REG_REQ   -> registrar nodo, responder REG_RESP.
  *   - EVENT     -> exige nodo registrado; registrar actividad, responder
  *                  EVENT_ACK (confirmacion de aplicacion).
- *   - AUTH_REQ  -> autenticacion stub (Fase 2): se acepta y se emite un token
- *                  dummy en AUTH_RESP. La validacion real es de Fase 3.
- *   - QUERY_REQ -> exige token no vacio (stub); responder QUERY_RESP con el
- *                  estado instantaneo o el historico.
+ *   - AUTH_REQ  -> (Fase 3) el servidor consulta al SERVICIO DE AUTENTICACION
+ *                  separado; si es valido crea una sesion y emite token+rol.
+ *   - QUERY_REQ -> exige un token valido (validado contra la tabla de
+ *                  sesiones); responder QUERY_RESP con el estado o el historico.
  *   - DISCONNECT-> cierre voluntario de la sesion.
  *   - Mensajes de nodo no registrado / formato invalido / token ausente ->
  *     ERROR con el codigo correspondiente.
@@ -20,6 +20,8 @@
 
 #include "manejador.h"
 #include "estado.h"
+#include "sesiones.h"
+#include "auth_cliente.h"
 
 #include "log_utils.h"
 #include "pmcd_protocol.h"
@@ -34,6 +36,21 @@
 #define ERR_NO_AUTORIZADO      "401"
 #define ERR_NODO_NO_REGISTRADO "409"
 #define ERR_TIPO_NO_SOPORTADO  "422"
+#define ERR_SERVICIO_AUTH      "503"
+
+/* Ubicacion del servicio de autenticacion (fijada por servidor.c al arrancar).
+   Se guardan copias propias para no depender del ciclo de vida de argv. */
+static char g_auth_host[128] = "";
+static char g_auth_puerto[16] = "";
+
+void manejador_config_auth(const char *auth_host, const char *auth_puerto) {
+    if (auth_host != NULL) {
+        snprintf(g_auth_host, sizeof(g_auth_host), "%s", auth_host);
+    }
+    if (auth_puerto != NULL) {
+        snprintf(g_auth_puerto, sizeof(g_auth_puerto), "%s", auth_puerto);
+    }
+}
 
 /* Envia un mensaje PMCD (tipo + payload) por el socket. Retorna 0/-1. */
 static int enviar(int fd, pmcd_tipo_t tipo, uint8_t flags,
@@ -118,33 +135,68 @@ static int on_event(int fd, const pmcd_header_t *h, const char *payload,
 
 static int on_auth_req(int fd, const pmcd_header_t *h, const char *payload,
                        const char *endpoint) {
-    /* Stub de Fase 2: aceptamos cualquier usuario no vacio y emitimos un
-       token dummy. La validacion real de credenciales es de Fase 3. */
-    char usuario[64] = "";
+    /* Fase 3: la validacion real la hace el SERVICIO DE AUTENTICACION separado.
+       El servidor central actua como cliente de ese servicio y, si las
+       credenciales son validas, crea una sesion local con el token emitido. */
+    char usuario[64] = "", clave[64] = "";
     pmcd_get_field(payload, "usuario", usuario, sizeof(usuario));
+    pmcd_get_field(payload, "clave", clave, sizeof(clave));
 
-    if (usuario[0] == '\0') {
+    if (usuario[0] == '\0' || clave[0] == '\0') {
         return enviar_error(fd, h->seq_num, ERR_FORMATO_INVALIDO,
-                            "falta usuario", endpoint);
+                            "faltan credenciales (usuario/clave)", endpoint);
+    }
+
+    char rol[SES_ROL_LEN] = "", token[SES_TOKEN_LEN] = "";
+    int r = auth_cliente_validar(g_auth_host, g_auth_puerto, usuario, clave,
+                                 rol, sizeof(rol), token, sizeof(token));
+
+    if (r == AUTHC_SIN_SERVICIO) {
+        /* Falla de comunicacion con el servicio de auth: el servidor sigue
+           vivo, pero no puede autenticar ahora. */
+        log_evento(LOG_INFO, endpoint, "AUTH",
+                   "servicio de autenticacion no disponible");
+        return enviar_error(fd, h->seq_num, ERR_SERVICIO_AUTH,
+                            "servicio de autenticacion no disponible", endpoint);
+    }
+    if (r == AUTHC_RECHAZADO) {
+        return enviar_error(fd, h->seq_num, ERR_NO_AUTORIZADO,
+                            "credenciales invalidas", endpoint);
+    }
+
+    /* AUTHC_OK: registrar la sesion local con el token emitido. */
+    if (sesiones_crear(token, usuario, rol) != 0) {
+        return enviar_error(fd, h->seq_num, ERR_SERVICIO_AUTH,
+                            "no se pudo crear la sesion", endpoint);
     }
 
     char resp[PMCD_MAX_PAYLOAD] = "";
     pmcd_build_payload(resp, sizeof(resp), "resultado", "OK");
-    /* Token dummy fijo para Fase 2. */
-    pmcd_build_payload(resp, sizeof(resp), "token", "TOKEN-FASE2");
+    pmcd_build_payload(resp, sizeof(resp), "rol", rol);
+    pmcd_build_payload(resp, sizeof(resp), "token", token);
     return enviar(fd, PMCD_AUTH_RESP, PMCD_FLAG_ES_RESPUESTA, h->seq_num,
                   resp, endpoint);
 }
 
 static int on_query_req(int fd, const pmcd_header_t *h, const char *payload,
                         const char *endpoint) {
-    char token[64] = "", id[64] = "", consulta[32] = "", n_str[16] = "";
+    char token[SES_TOKEN_LEN] = "", id[64] = "", consulta[32] = "", n_str[16] = "";
+    char rol[SES_ROL_LEN] = "";
 
-    /* Stub de auth: exigimos token no vacio (no validamos su contenido). */
+    /* Fase 3: validacion REAL del token contra la tabla de sesiones. */
     if (pmcd_get_field(payload, "token", token, sizeof(token)) != 1 ||
         token[0] == '\0') {
         return enviar_error(fd, h->seq_num, ERR_NO_AUTORIZADO,
-                            "token ausente o invalido", endpoint);
+                            "token ausente", endpoint);
+    }
+    int v = sesiones_validar(token, rol, sizeof(rol));
+    if (v == 0) {
+        return enviar_error(fd, h->seq_num, ERR_NO_AUTORIZADO,
+                            "token invalido", endpoint);
+    }
+    if (v == -1) {
+        return enviar_error(fd, h->seq_num, ERR_NO_AUTORIZADO,
+                            "token expirado", endpoint);
     }
 
     pmcd_get_field(payload, "nodo_id", id, sizeof(id));

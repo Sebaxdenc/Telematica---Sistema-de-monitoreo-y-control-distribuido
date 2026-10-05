@@ -6,57 +6,70 @@ Distribuido) sobre la API de Sockets Berkeley en C.
 
 **Integrante:** Sebastian Andres Medina Cabezas
 
-> **Estado: Fase 2 — Comunicación básica.** El diseño del protocolo se definió en la
-> Fase 1 (`docs/`). Esta fase implementa la comunicación funcional entre nodos,
-> servidor central y cliente de administración: creación/configuración de sockets,
-> establecimiento de la comunicación, envío/recepción/interpretación de mensajes,
-> construcción de respuestas y las reglas básicas del protocolo. Incluye una base de
-> concurrencia (hilo por conexión TCP + hilo dedicado UDP) que prepara la Fase 3.
+> **Estado: Fase 3 — Concurrencia, resiliencia y autenticación (completa).**
+> Sobre la comunicación básica de la Fase 2, esta fase añade: un **servicio de
+> autenticación separado** con roles y tokens, **detección de nodos inactivos** por
+> temporizador, **control de duplicados/orden** en UDP y manejo robusto de todos los
+> errores del enunciado. Detalle en `docs/fase3_resiliencia.md`.
 
 ## Arquitectura
 
 Nodos y clientes se comunican **solo a través del servidor central**; nunca entre sí.
+El servidor, a su vez, consulta al **servicio de autenticación** (proceso aparte).
 
 ```
    Nodo 1 ─┐  UDP: TELEMETRY, HEARTBEAT
-           ├──────────────────────────────►┌──────────────────┐
-   Nodo 2 ─┘  TCP: REG_REQ, EVENT          │  Servidor central │
-                                           │   (C, Berkeley)   │
-   Cliente ────────────────────────────────►│  tabla + histórico│
-              TCP: AUTH_REQ, QUERY_REQ      └──────────────────┘
+           ├──────────────────────────────►┌──────────────────┐   TCP: AUTH_REQ
+   Nodo 2 ─┘  TCP: REG_REQ, EVENT          │  Servidor central │◄────────────────┐
+                                           │   (C, Berkeley)   │                 │
+   Cliente ────────────────────────────────►│  tabla+histórico │        ┌────────▼────────┐
+              TCP: AUTH_REQ, QUERY_REQ      │  + sesiones      │        │ Servicio de auth │
+                                           └──────────────────┘        │ (proceso aparte) │
+                                                                        └──────────────────┘
 ```
 
 - **Servidor central** (`servidor/`): C puro con Sockets Berkeley. Registra nodos,
-  recibe telemetría (UDP) y eventos (TCP), mantiene el estado y el histórico en
+  recibe telemetría (UDP) y eventos (TCP), mantiene estado, histórico y sesiones en
   memoria y responde consultas. Atiende conexiones TCP concurrentes (un hilo por
-  conexión) y procesa la telemetría UDP en un hilo dedicado. Recibe por parámetro el
-  **puerto** y el **archivo de logs**, y registra cada petición/respuesta en consola y
-  archivo con la **IP y puerto de origen**.
+  conexión, con límite), procesa UDP en un hilo dedicado y detecta nodos inactivos en
+  un hilo monitor. Recibe por parámetro **puerto**, **archivo de logs** y la ubicación
+  del **servicio de auth**. Registra cada petición/respuesta con **IP y puerto de
+  origen**.
+- **Servicio de autenticación** (`auth/`): proceso independiente con su propio almacén
+  de credenciales y roles. Valida usuario/clave y emite un token de sesión.
 - **Nodo** (`nodo/`): simula un sensor. Se registra, envía telemetría periódica por
-  UDP y reporta eventos críticos por TCP.
-- **Cliente de administración** (`cliente/`): se autentica y consulta el estado
-  instantáneo, el histórico (≥5 muestras) y un resumen de los nodos.
+  UDP y reporta eventos críticos por TCP. Se re-registra si el servidor deja de
+  reconocerlo.
+- **Cliente de administración** (`cliente/`): se autentica (usuario/clave), consulta el
+  estado instantáneo, el histórico (≥5 muestras) y un resumen. Se re-autentica solo si
+  su token expira.
 - **Código compartido** (`comun/`): protocolo PMCD, utilidades de sockets (con
   `getaddrinfo`, sin IPs fijas) y logging.
 
 ```
 .
-├── Makefile                 # compila servidor, nodo y cliente en bin/
+├── Makefile                 # compila auth, servidor, nodo y cliente en bin/
 ├── README.md
 ├── docs/
-│   ├── Fase1_Diseno_Arquitectura_PMCD.md   # diseño de Fase 1 (copia en el repo)
-│   └── ajustes_fase1.md                    # decisiones consolidadas en Fase 2
+│   ├── Fase1_Diseno_Arquitectura_PMCD.md   # diseño de Fase 1
+│   ├── ajustes_fase1.md                    # decisiones consolidadas
+│   └── fase3_resiliencia.md                # concurrencia, auth, resiliencia, errores
+├── scripts/
+│   └── demo_fase3.sh        # demo integral reproducible
 ├── comun/
 │   ├── pmcd_protocol.h/.c    # tipos, encabezado 16B, pack/unpack, payload
 │   ├── socket_utils.h/.c     # getaddrinfo, sockets TCP/UDP, send_all, recv_msg
-│   ├── log_utils.h/.c        # logging a consola + archivo con IP:puerto
-│   ├── test_protocolo.c      # pruebas del protocolo (make test)
-│   └── test_socket.c         # pruebas de sockets (make test-socket)
+│   └── log_utils.h/.c        # logging a consola + archivo con IP:puerto
+├── auth/
+│   └── auth.c                # servicio de autenticación separado
 ├── servidor/
-│   ├── servidor.c            # main: args, hilo UDP, aceptación TCP concurrente
-│   ├── estado.h/.c           # tabla de nodos + histórico (mutex)
-│   ├── manejador.h/.c        # interpretación de mensajes TCP
-│   └── udp_worker.h/.c       # hilo de recepción UDP
+│   ├── servidor.c            # main: args, hilos UDP/monitor, aceptación TCP concurrente
+│   ├── estado.h/.c           # tabla de nodos + histórico + SEQ_NUM (mutex)
+│   ├── manejador.h/.c        # interpretación de mensajes TCP + auth real
+│   ├── udp_worker.h/.c       # hilo de recepción UDP + duplicados/orden
+│   ├── monitor.h/.c          # hilo de detección de inactividad
+│   ├── sesiones.h/.c         # tabla de sesiones/tokens
+│   └── auth_cliente.h/.c     # cliente del servicio de auth
 ├── nodo/nodo.c
 └── cliente/cliente.c
 ```
@@ -72,7 +85,8 @@ Nodos y clientes se comunican **solo a través del servidor central**; nunca ent
 ## Compilación
 
 ```bash
-make              # compila los tres ejecutables en bin/
+make              # compila los cuatro ejecutables en bin/
+make auth         # solo el servicio de autenticación
 make servidor     # solo el servidor
 make nodo         # solo el nodo
 make cliente      # solo el cliente
@@ -86,32 +100,46 @@ compila sin warnings.
 
 ## Ejecución
 
-Abre una terminal por componente (todas en WSL, en la raíz del repo).
+Se levantan **cuatro procesos** (una terminal por componente, todas en WSL, en la raíz
+del repo). El orden recomendado es: auth → servidor → nodos → cliente.
 
-**1. Servidor** — recibe `puerto` y `archivoDeLogs`:
+**1. Servicio de autenticación** — `puerto`:
 
 ```bash
-./bin/servidor 5000 servidor.log
+./bin/auth 6000
 ```
 
-**2. Nodo(s)** — `host puerto nodo_id [tipo] [intervalo_seg]`:
+**2. Servidor central** — `puerto archivoDeLogs authHost authPuerto`:
+
+```bash
+./bin/servidor 5000 servidor.log localhost 6000
+```
+
+**3. Nodo(s)** — `host puerto nodo_id [tipo] [intervalo_seg]`:
 
 ```bash
 ./bin/nodo localhost 5000 N001 sensor_temp 2
 ./bin/nodo localhost 5000 N002 sensor_humedad 3
 ```
 
-**3. Cliente de administración** — `host puerto usuario [comando...]`:
+**4. Cliente de administración** — `host puerto usuario clave [comando...]`:
 
 ```bash
 # Modo interactivo
-./bin/cliente localhost 5000 admin
+./bin/cliente localhost 5000 admin admin123
 
 # Comando único
-./bin/cliente localhost 5000 admin estado N001
-./bin/cliente localhost 5000 admin historico N001 5
-./bin/cliente localhost 5000 admin resumen
+./bin/cliente localhost 5000 admin admin123 estado N001
+./bin/cliente localhost 5000 admin admin123 historico N001 5
+./bin/cliente localhost 5000 operador oper123 resumen
 ```
+
+Credenciales de ejemplo (definidas en el servicio de auth):
+
+| Usuario    | Clave      | Rol           |
+|------------|------------|---------------|
+| `admin`    | `admin123` | administrador |
+| `operador` | `oper123`  | operador      |
 
 Comandos del cliente:
 
@@ -122,8 +150,14 @@ Comandos del cliente:
 | `resumen` | lista de nodos y su estado |
 | `salir` | termina el cliente |
 
-Para detener el servidor, `Ctrl+C`: cierra los sockets, detiene el hilo UDP y cierra
-el log de forma ordenada.
+Para detener el servidor, `Ctrl+C`: cierra los sockets, detiene los hilos UDP y
+monitor y cierra el log de forma ordenada.
+
+### Demo automática
+
+```bash
+bash scripts/demo_fase3.sh   # levanta todo y ejercita auth, telemetría, consultas y errores
+```
 
 ## Protocolo PMCD/1.0
 
@@ -158,7 +192,8 @@ dentro de un valor se escapan con `\` (por ejemplo `detalle=temp\=80.9`).
 | 0x0C | `DISCONNECT` | TCP | Nodo/Cliente → Servidor |
 
 Códigos de error (payload de `ERROR`): `400` formato inválido, `401` no autorizado
-(token ausente/ inválido), `409` nodo no registrado, `422` tipo no soportado.
+(token ausente/ inválido/expirado o credenciales inválidas), `409` nodo no registrado,
+`422` tipo no soportado, `503` servicio de auth no disponible.
 
 ## Mapeo especificación ↔ código
 
@@ -177,20 +212,26 @@ para la sustentación:
 | Evento con confirmación (`EVENT`/`EVENT_ACK`) | `servidor/manejador.c`: `on_event`; `nodo/nodo.c`: `enviar_evento` |
 | Consulta y respuesta (`QUERY_REQ`/`QUERY_RESP`) | `servidor/manejador.c`: `on_query_req`; `cliente/cliente.c` |
 | Estado consolidado + histórico | `servidor/estado.c` |
-| Reglas: nodo no registrado, token, formato | `servidor/manejador.c` (códigos 400/401/409/422) |
-| Concurrencia (hilo por conexión + hilo UDP) | `servidor/servidor.c` (mutex/cond, `MAX_CONNECTIONS`) |
+| Reglas: nodo no registrado, token, formato | `servidor/manejador.c` (códigos 400/401/409/422/503) |
+| Concurrencia (hilo por conexión + hilo UDP + monitor) | `servidor/servidor.c` (mutex/cond, `MAX_CONNECTIONS`) |
 | Logging con IP:puerto a consola y archivo | `comun/log_utils.c`: `log_evento` |
+| Autenticación separada (roles, tokens) | `auth/auth.c`; `servidor/auth_cliente.c`; `servidor/sesiones.c` |
+| Detección de nodos inactivos (temporizador) | `servidor/monitor.c`; `servidor/estado.c`: `estado_revisar_inactividad` |
+| Duplicados / orden en UDP (SEQ_NUM) | `servidor/estado.c`: `estado_chequear_seq`; `servidor/udp_worker.c` |
+| Re-registro del nodo / re-autenticación del cliente | `nodo/nodo.c`: `enviar_evento`; `cliente/cliente.c`: `consultar` |
 
 ## Pruebas rápidas
 
 ```bash
 make test         # 25/25 pruebas del protocolo
 make test-socket  # 8/8 pruebas de sockets (resolución + intercambio PMCD)
+bash scripts/demo_fase3.sh   # demo integral de Fase 3
 ```
 
 ## Fases
 
 - **Fase 1** — Diseño y arquitectura (`docs/Fase1_Diseno_Arquitectura_PMCD.md`).
-- **Fase 2** — Comunicación básica *(esta entrega)*.
-- **Fase 3** — Concurrencia avanzada, resiliencia (timeouts, retransmisión,
-  duplicados) y autenticación real. La base de concurrencia ya está sentada aquí.
+- **Fase 2** — Comunicación básica.
+- **Fase 3** — Concurrencia, resiliencia y autenticación *(esta entrega)*. Servicio de
+  auth separado, detección de inactividad, control de duplicados/orden y manejo de
+  errores. Ver `docs/fase3_resiliencia.md`.
